@@ -14,7 +14,7 @@ from inbox.sqlalchemy.revision import versioned_session
 from inbox.sqlalchemy.util import ForceStrictMode
 
 def db_uri():
-    uri_template = 'mysql://{username}:{password}@{host}:{port}/{database}?charset=utf8mb4'
+    uri_template = 'mysql+pymysql://{username}:{password}@{host}:{port}/{database}?charset=utf8mb4'
 
     config_prefix = 'RDS' if is_prod() else 'MYSQL'
 
