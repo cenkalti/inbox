@@ -74,7 +74,6 @@ from geventconnpool import retry
 from gevent import Greenlet, sleep
 
 from inbox.util.itert import chunk, partition
-from inbox.util.misc import timed
 
 from ..log import get_logger
 from ..crispin import new_crispin

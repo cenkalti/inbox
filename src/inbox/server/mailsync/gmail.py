@@ -34,7 +34,6 @@ from ..models.tables import ImapAccount, Namespace, ImapUid, Message
 
 from inbox.util.itert import chunk, partition
 from inbox.util.cache import set_cache, get_cache, rm_cache
-from inbox.util.misc import timed
 
 class GmailSyncMonitor(ImapSyncMonitor):
     def __init__(self, account_id, namespace_id, email_address, provider,
