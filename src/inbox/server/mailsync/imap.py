@@ -71,7 +71,8 @@ from datetime import datetime
 from gc import collect as garbage_collect
 
 from geventconnpool import retry
-from gevent import Greenlet, sleep
+from gevent import Greenlet, sleep, spawn
+from gevent.queue import LifoQueue
 
 from inbox.util.itert import chunk, partition
 
@@ -221,21 +222,30 @@ def base_initial_sync(crispin_client, db_session, log, folder_name,
         shared_state, initial_sync_fn):
     """ Downloads entire messages.
 
-    This method may be retried as many times as you like; it will pick up where
-    it left off, delete removed messages if things disappear between restarts,
-    and only complete once we have all the UIDs in the given folder locally.
+    This function may be retried as many times as you like; it will pick up
+    where it left off, delete removed messages if things disappear between
+    restarts, and only complete once we have all the UIDs in the given folder
+    locally.
+
+    This function also starts up a secondary greenlet that checks for new
+    messages periodically, to deal with the case of very large folders---it's
+    a bad experience for the user to keep receiving old mail but not receive
+    new mail! We use a LIFO queue to make sure we're downloading newest mail
+    first.
     """
     log.info('Starting initial sync for {0}'.format(folder_name))
 
     local_uids = account.all_uids(crispin_client.account_id,
             db_session, folder_name)
 
+    uid_download_stack = LifoQueue()
+
     with crispin_client.pool.get() as c:
         crispin_client.select_folder(folder_name,
                 uidvalidity_cb(db_session, crispin_client.account_id), c)
 
         initial_sync_fn(crispin_client, db_session, log, folder_name,
-                shared_state, local_uids, c)
+                shared_state, local_uids, c, uid_download_stack)
 
     verify_db(crispin_client, db_session)
 
@@ -311,11 +321,21 @@ def highestmodseq_update(crispin_client, db_session, log, folder_name,
             new_uidvalidity, new_highestmodseq)
     db_session.commit()
 
+def uid_list_to_stack(uids):
+    """ UID download function needs a stack even for polling. """
+    uid_download_stack = LifoQueue()
+    for uid in sorted(uids, key=int):
+        uid_download_stack.put(uid)
+    return uid_download_stack
+
 def imap_highestmodseq_update(crispin_client, db_session, log, folder_name,
         uids, local_uids, status_cb, syncmanager_lock, c):
-    chunked_uid_download(crispin_client, db_session, log, folder_name, uids, 0,
-            len(uids), status_cb, download_and_commit_uids,
-            account.create_message, syncmanager_lock, c)
+    uid_download_stack = uid_list_to_stack(uids)
+
+    chunked_uid_download(crispin_client, db_session, log, folder_name,
+            uid_download_stack, 0, uid_download_stack.qsize(), status_cb,
+            download_and_commit_uids, account.create_message, syncmanager_lock,
+            c)
 
 def uidvalidity_cb(db_session, account_id):
     def fn(folder, select_info):
@@ -337,11 +357,18 @@ def new_or_updated(uids, local_uids):
     """
     return partition(lambda x: x in local_uids, uids)
 
+def add_uids_to_stack(uids, uid_download_stack):
+    for uid in sorted(uids, key=int):
+        uid_download_stack.put(uid)
+
 def imap_initial_sync(crispin_client, db_session, log, folder_name,
-        shared_state, local_uids, c):
+        shared_state, local_uids, c, uid_download_stack):
     check_flags(crispin_client, db_session, log, folder_name, local_uids,
             shared_state['syncmanager_lock'], c)
 
+    # make sure to grab the next uid _before_ getting all uids to guarantee
+    # we don't miss messages
+    next_uid = crispin_client.next_uid(folder_name, c)
     remote_uids = crispin_client.all_uids(c)
     log.info("Found {0} UIDs for folder {1}".format(len(remote_uids),
         folder_name))
@@ -351,16 +378,52 @@ def imap_initial_sync(crispin_client, db_session, log, folder_name,
             crispin_client.account_id, db_session, log, folder_name,
             local_uids, remote_uids, shared_state['syncmanager_lock'], c)
 
-    unknown_uids = set(remote_uids) - set(local_uids)
+    add_uids_to_stack(set(remote_uids) - set(local_uids), uid_download_stack)
+
+    new_uid_poller = spawn(check_new_uids, crispin_client, folder_name, log,
+            uid_download_stack, next_uid, shared_state['poll_frequency'])
 
     chunked_uid_download(crispin_client, db_session, log, folder_name,
-            unknown_uids, len(local_uids), len(remote_uids),
+            uid_download_stack, len(local_uids), len(remote_uids),
             shared_state['status_cb'], shared_state['syncmanager_lock'],
             download_and_commit_uids, account.create_message, c)
 
+    new_uid_poller.kill()
+
+def check_new_uids(crispin_client, folder_name, log, uid_download_stack,
+        next_uid, poll_frequency):
+    """ Check for new UIDs and add them to the download stack.
+
+    We do this by comparing the current UIDNEXT value to the previously
+    seen value. Since UIDs are guaranteed to be assigned in ascending order
+    (see http://tools.ietf.org/html/rfc3501#section-2.3.1.1), this will
+    detect new messages in a given folder.
+
+    We grab a new IMAP connection from the pool for this to isolate its
+    actions from whatever the main greenlet may be doing.
+
+    Runs until killed. (Intended to be run in a greenlet.)
+    """
+    with session_scope() as c:
+        while True:
+            uid = crispin_client.next_uid(folder_name, c)
+            if uid > next_uid:
+                # make sure we have the right folder selected
+                crispin_client.select_folder(folder_name, c)
+                next_uid = uid
+                new_uids = crispin_client.search_uids('UID {uid}:*'.format(
+                    uid=(next_uid-1)))
+                assert new_uids, \
+                        "No new uids found in {folder} with UIDNEXT {uidnext}" \
+                        .format(folder=folder_name, uidnext=next_uid)
+                for new_uid in new_uids:
+                    uid_download_stack.put(new_uid)
+            sleep(poll_frequency)
+
 def check_flags(crispin_client, db_session, log, folder_name, local_uids,
         syncmanager_lock, c):
-    """
+    """ Update message flags if folder has changed on the remote.
+
     If we have a saved uidvalidity for this folder, make sure the folder hasn't
     changed since we saved it. Otherwise we need to query for flag changes too.
     """
@@ -375,28 +438,48 @@ def check_flags(crispin_client, db_session, log, folder_name, local_uids,
                 update_metadata(crispin_client, db_session, log, folder_name,
                         updated, syncmanager_lock, c)
 
+def get_chunk_from_queue(q, chunk_size):
+    """ Retrieve at most `chunk_size` elements from `q`.
+
+    Returns
+    -------
+    list
+        If empty, means `q` is empty.
+    """
+    chunk_uids = []
+
+    while len(chunk_uids) < chunk_size:
+        uid = q.get_nowait()
+        if uid is None:
+            break
+        else:
+            chunk_uids.append(uid)
+
+    return chunk_uids
+
 def chunked_uid_download(crispin_client, db_session, log,
-        folder_name, uids, num_local_messages, num_total_messages, status_cb,
-        syncmanager_lock, download_commit_fn, msg_create_fn, c):
-    log.info("{0} uids left to fetch".format(len(uids)))
+        folder_name, uid_download_stack, num_local_messages,
+        num_total_messages, status_cb, syncmanager_lock, download_commit_fn,
+        msg_create_fn, c):
+    log.info("{0} uids left to fetch".format(uid_download_stack.qsize()))
+    log.info("Starting sync for {0} with chunks of size {1}"\
+            .format(folder_name, crispin_client.CHUNK_SIZE))
 
-    if uids:
-        chunk_size = crispin_client.CHUNK_SIZE
-        log.info("Starting sync for {0} with chunks of size {1}"\
-                .format(folder_name, chunk_size))
-        # we prioritize message download by reverse-UID order, which
-        # generally puts more recent messages first
-        for uids in chunk(reversed(uids), chunk_size):
-            num_local_messages += download_commit_fn(crispin_client,
-                    db_session, log, folder_name, uids, msg_create_fn,
-                    syncmanager_lock, c)
+    uids = get_chunk_from_queue(uid_download_stack,
+            crispin_client.CHUNK_SIZE)
+    while uids:
+        num_local_messages += download_commit_fn(crispin_client,
+                db_session, log, folder_name, uids, msg_create_fn,
+                syncmanager_lock, c)
 
-            percent_done = (num_local_messages / num_total_messages) * 100
-            status_cb(crispin_client.account_id,
-                    'initial', (folder_name, percent_done))
-            log.info("Syncing %s -- %.2f%% (%i/%i)" % (folder_name,
-                percent_done, num_local_messages, num_total_messages))
-        log.info("Saved all messages and metadata on {0} to UIDVALIDITY {1} / HIGHESTMODSEQ {2}".format(folder_name, crispin_client.selected_uidvalidity, crispin_client.selected_highestmodseq))
+        percent_done = (num_local_messages / num_total_messages) * 100
+        status_cb(crispin_client.account_id,
+                'initial', (folder_name, percent_done))
+        log.info("Syncing %s -- %.2f%% (%i/%i)" % (folder_name,
+            percent_done, num_local_messages, num_total_messages))
+        uids = get_chunk_from_queue(uid_download_stack,
+                crispin_client.CHUNK_SIZE)
+    log.info("Saved all messages and metadata on {0} to UIDVALIDITY {1} / HIGHESTMODSEQ {2}".format(folder_name, crispin_client.selected_uidvalidity, crispin_client.selected_highestmodseq))
 
 def safe_download(crispin_client, log, uids, c):
     try:

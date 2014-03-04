@@ -107,6 +107,21 @@ class CrispinClientBase(object):
     def _fetch_folder_status(self, folder, c):
         raise NotImplementedError
 
+    def next_uid(self, folder, c):
+        status = self.folder_status(folder, c)
+        return status['UIDNEXT']
+
+    def search_uids(self, folder, criteria, c):
+        """ Find not-deleted UIDs in this folder matching the criteria.
+
+        See http://tools.ietf.org/html/rfc3501.html#section-6.4.4 for valid
+        criteria.
+        """
+        return self._search_uids(folder, criteria, c)
+
+    def _search_uids(self, folder, criteria, c):
+        raise NotImplementedError
+
     def all_uids(self, c):
         """ Get all UIDs associated with the currently selected folder as
             a list of integers sorted in ascending order.
@@ -548,6 +563,14 @@ class GmailCrispinClient(CrispinClient):
         """
         criteria = 'X-GM-THRID {0}'.format(g_thrid)
         return c.search(['NOT DELETED', criteria])
+
+    def _search_uids(self, folder, criteria, c):
+        full_criteria = ['NOT DELETED']
+        if isinstance(criteria, list):
+            full_criteria.extend(criteria)
+        else:
+            full_criteria.append(criteria)
+        return c.search(full_criteria)
 
     ### the following methods WRITE to the IMAP account!
 
