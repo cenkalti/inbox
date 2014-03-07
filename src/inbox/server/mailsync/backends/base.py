@@ -1,12 +1,16 @@
+import os, sys
 import zerorpc
 
 from gevent import Greenlet, joinall, sleep
 from gevent.queue import Queue, Empty
 
-from ..config import config
-from ..log import configure_sync_logging
+# TODO[k]: Make relative imports
+from inbox.server.config import config
+from inbox.server.log import configure_sync_logging
+from inbox.server.mailsync.exc import SyncException
 
-from .exc import SyncException
+MONITOR_CLS_FOR = {}
+
 
 def verify_db(crispin_client, db_session):
     pass
@@ -110,3 +114,30 @@ class BaseMailSyncMonitor(Greenlet):
 
     def sync(self):
         raise NotImplementedError
+
+
+    @classmethod
+    def register_backends(cls):
+        """
+        Finds the monitor modules for the different providers
+        (in the backends directory) and imports them.
+
+        Creates a mapping of provider:monitor for each backend found.
+        """
+        # Find and import
+        backend_dir = os.path.dirname(os.path.realpath(__file__))
+        backend_files = [x[:-3] for x in os.listdir(backend_dir) if x.endswith('.py')]
+
+        sys.path.insert(1, backend_dir)
+
+        modules = [__import__(backend) for backend in backend_files]
+
+        # Create mapping
+        for module in modules:
+            if getattr(module, 'PROVIDER', None) is not None:
+                provider = module.PROVIDER
+                monitor_cls = getattr(module, '%sSyncMonitor' % provider)
+
+                MONITOR_CLS_FOR[provider] = monitor_cls
+
+        return MONITOR_CLS_FOR
