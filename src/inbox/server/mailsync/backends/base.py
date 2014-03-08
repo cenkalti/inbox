@@ -115,7 +115,6 @@ class BaseMailSyncMonitor(Greenlet):
     def sync(self):
         raise NotImplementedError
 
-
     @classmethod
     def register_backends(cls):
         """
